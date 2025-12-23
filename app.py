@@ -1,118 +1,122 @@
 import streamlit as st
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+import re
+import time
+import io
+from googlesearch import search
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from webdriver_manager.core.os_manager import ChromeType
-from bs4 import BeautifulSoup
-import pandas as pd
-import time
-import io
-import re
-from googlesearch import search
 
-# --- BROWSER CONFIGURATION ---
-@st.cache_resource
-def get_driver():
-    """Sets up a headless Chrome browser for the cloud server."""
-    options = Options()
-    options.add_argument("--headless") # Essential for Cloud deployment
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-    
-    return webdriver.Chrome(
-        service=Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()),
-        options=options
-    )
+# --- TECHY UI CONFIG ---
+st.set_page_config(page_title="NEURAL DATA EXTRACTOR v5.0", page_icon="⚡", layout="wide")
 
-# --- EXPANDED KEYWORD MAPPING ---
-# We solve 'Keyword Mismatch' by listing all possible synonyms for your fields.
-KEYWORD_MAP = {
-    "Ingredients": ["Ingredients", "Supplement Facts", "What's inside", "Active Ingredients", "Composition", "Formula"],
-    "Safety Warning": ["Safety Warning", "Warning", "Precautions", "Cautions", "Contraindications", "Attention"],
-    "Directions": ["Directions", "How to use", "Suggested Use", "Dosage", "Instructions", "Administration"],
-    "Shelf Life": ["Shelf life", "Storage", "Expiration", "Best before", "Keep until"],
-    "Item Form": ["Item Form", "Format", "Capsule", "Tablet", "Powder", "Softgel", "Liquid", "Gummy"],
-    "Quantity": ["Quantity", "Count", "Size", "Net Wt", "Volume", "Weight", "Amount per container"],
-    "Flavor": ["Flavor", "Taste", "Scent", "Aroma"],
-    "Target Gender": ["Gender", "Target Audience", "For Men", "For Women", "Unisex"],
-    "Benefits": ["Benefits", "Product Features", "Key Features", "Why you'll love it"],
-    "Indications": ["Indications", "Usage", "Used for", "Health concern"]
-}
+st.markdown("""
+    <style>
+    .stApp { background-color: #0e1117; color: #00ff41; font-family: 'Courier New', monospace; }
+    h1, h2, h3 { color: #00ff41 !important; text-shadow: 0 0 10px #00ff41; }
+    .stDownloadButton>button { background-color: #00ff41 !important; color: black !important; font-weight: bold; width: 100%; border: none; }
+    .stButton>button { background-color: transparent !important; color: #00ff41 !important; border: 1px solid #00ff41 !important; width: 100%; }
+    .stButton>button:hover { background-color: #00ff41 !important; color: black !important; }
+    </style>
+    """, unsafe_allow_html=True)
 
-# --- DATA EXTRACTION WITH RETRY LOGIC ---
-def smart_extract(url, retry_attempt=1):
-    driver = get_driver()
+# --- SMART GUESS LOGIC (from your HTML) ---
+def smart_guess(title):
+    t = str(title).lower()
+    rules = [
+        (r'ashwagandha', 'Organic Ashwagandha Root Extract, Black Pepper Extract'),
+        (r'magnesium', 'Magnesium Bisglycinate Chelate, Magnesium Stearate'),
+        (r'turmeric|curcumin', 'Turmeric Extract (95% Curcuminoids), Black Pepper Extract'),
+        (r'vitamin c', 'Vitamin C (ascorbic acid)'),
+        (r'melatonin', 'Melatonin, Silica'),
+        (r'collagen', 'Hydrolyzed Collagen Peptides'),
+        (r'zinc', 'Zinc Picolinate')
+    ]
+    for pattern, ingredients in rules:
+        if re.search(pattern, t):
+            return ingredients
+    return "Microcrystalline Cellulose, Magnesium Stearate, Silica" # Your Generic Fallback
+
+# --- EXTRACTION ENGINE ---
+def extract_logic(url, item_name):
     try:
-        driver.get(url)
-        # We wait 5-10 seconds for JavaScript to load
-        wait_time = 5 if retry_attempt == 1 else 10
-        time.sleep(wait_time) 
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return {"Status": "Site Blocked", "Ingredients list": smart_guess(item_name)}
         
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-        page_text = soup.get_text().lower()
+        soup = BeautifulSoup(resp.content, 'html.parser')
         
-        results = {"URL": url}
-        
-        # Search for each bucket in the Keyword Map
-        for field, synonyms in KEYWORD_MAP.items():
-            found = False
-            for k in synonyms:
+        def find_val(keys):
+            for k in keys:
                 match = soup.find(string=re.compile(rf"\b{k}\b", re.I))
                 if match:
-                    # Capture the text directly following the label
                     val = match.find_next().get_text(strip=True) if match.find_next() else ""
-                    if len(val) > 2:
-                        results[field] = re.sub(r'[^\w\s.,!?-]', '', val).strip()[:400]
-                        found = True
-                        break
-            if not found:
-                results[field] = "N/A"
+                    return val[:400]
+            return None
 
-        # Check for Hazmat clues
-        results["Hazmat(y/n)"] = "Y" if any(x in page_text for x in ["flammable", "corrosive", "hazmat", "danger"]) else "N"
+        ingredients = find_val(["Ingredients", "Supplement Facts", "What's inside"])
         
-        # --- RETRY FEATURE ---
-        # If the main fields are N/A, try one more time with a longer wait
-        if results["Ingredients"] == "N/A" and retry_attempt == 1:
-            st.warning(f"Retrying Node: {url[:40]}...")
-            return smart_extract(url, retry_attempt=2)
+        return {
+            "URL": url,
+            "Ingredients list": ingredients if ingredients else smart_guess(item_name),
+            "Safety Warning": find_val(["Safety Warning", "Warning", "Precautions"]),
+            "Directions": find_val(["Directions", "How to use", "Suggested Use"]),
+            "Item Form": find_val(["Item Form", "Capsule", "Tablet", "Powder"]),
+            "Hazmat(y/n)": "Y" if any(x in soup.get_text().lower() for x in ["flammable", "hazmat"]) else "N"
+        }
+    except:
+        return {"Status": "Search failed", "Ingredients list": smart_guess(item_name)}
+
+# --- UI LAYOUT ---
+st.title("⚡ MASTER INGREDIENT GENERATOR")
+tab1, tab2 = st.tabs(["[ INPUT ]", "[ OUTPUT ]"])
+
+with tab1:
+    master_site = st.text_input("TARGET WEBSITE (e.g., gnc.com)", "gnc.com")
+    uploaded_file = st.file_uploader("UPLOAD SOURCE FILE", type=["xlsx", "csv"])
+    manual_input = st.text_area("OR PASTE ITEM NAMES")
+    start_btn = st.button("INITIALIZE GENERATION")
+
+if start_btn:
+    items = []
+    if uploaded_file:
+        df_in = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('xlsx') else pd.read_csv(uploaded_file)
+        col = next((c for c in df_in.columns if "name" in c.lower() or "title" in c.lower()), df_in.columns[0])
+        items = df_in[col].dropna().tolist()
+    elif manual_input:
+        items = [i.strip() for i in manual_input.split('\n') if i.strip()]
+
+    if items:
+        prog = st.progress(0)
+        results = []
+        for i, item in enumerate(items):
+            st.caption(f"PROCESSING NODE: {item[:50]}...")
+            try:
+                # Clean name for searching (first 5 words)
+                clean_name = " ".join(str(item).split()[:5])
+                query = f"site:{master_site} {clean_name}"
+                link = next(search(query, num_results=1))
+                data = extract_logic(link, item)
+            except:
+                # If search fails, use the Smart Guess logic instantly
+                data = {"Status": "Search failed", "Ingredients list": smart_guess(item)}
             
-        return results
-    except Exception as e:
-        return {"Status": f"Error: {str(e)}"}
-
-# --- TECHY UI ---
-st.title("⚡ NEURAL DATA EXTRACTOR v4.0")
-st.markdown("<style>.stApp { background-color: #0e1117; color: #00ff41; }</style>", unsafe_allow_html=True)
-
-domain = st.text_input("ENTER DOMAIN (e.g. gnc.com)", "gnc.com")
-item_input = st.text_area("PASTE ITEM NAMES")
-
-if st.button("INITIALIZE"):
-    items = [i.strip() for i in item_input.split('\n') if i.strip()]
-    final_data = []
-    
-    prog = st.progress(0)
-    for i, item in enumerate(items):
-        st.caption(f"SCANNING: {item}")
-        try:
-            query = f"site:{domain} {item}"
-            link = next(search(query, num_results=1))
-            data = smart_extract(link)
             data["Item Name"] = item
-            final_data.append(data)
-        except:
-            final_data.append({"Item Name": item, "Status": "Link Not Found"})
-        prog.progress((i + 1) / len(items))
+            results.append(data)
+            prog.progress((i + 1) / len(items))
+            time.sleep(1.5)
 
-    df = pd.DataFrame(final_data)
-    st.success("SCAN COMPLETE.")
-    st.dataframe(df)
-    
-    # Download excel
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False)
-    st.download_button("📥 DOWNLOAD RESULTS", output.getvalue(), "extracted_data.xlsx")
+        final_df = pd.DataFrame(results)
+        with tab2:
+            st.success("PROTOCOL COMPLETE")
+            st.dataframe(final_df)
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                final_df.to_excel(writer, index=False)
+            st.download_button("📥 DOWNLOAD INGREDIENTS CSV", output.getvalue(), "ingredients_results.xlsx")
